@@ -20,6 +20,11 @@ Docker Compose 启动。
 | 新版一次性纳入已受理扫描：实收、冲突、无凭证、明细同一事务生效 | `correct_packing_list` 的激活事务 |
 | 变更失败继续按原装箱单供数 | 失败分支：原版本/原结果不被修改，并记录 `failed` 版本 |
 | 未知箱号 / 不在装箱单中的序列号 | 计为 `unmatched` 扫描，不产生假实收 |
+| 按收货点分页查询跨点冲突，只列牵涉本点的冲突仪器，每件仍带全部上报点和扫描号 | `GET .../result?receiving_point=`、`app/service.py` `get_conflicts_page` |
+| 本页引用的扫描明细各返回一次；整箱展开沿用所查结果的内容 | `result_conflict_evidence` 按 `seq` 去重，展开读 `result_scan_details` 快照 |
+| 续页沿用同一结果号和收货点，按原冲突顺序翻页；期间新扫描或装箱单更正不漏项、不重项 | 游标绑定 `(result_id, receiving_point, position)`，结果快照不可变 |
+| 分页只定位该点的冲突和本页引用的扫描，免扫整批明细 | `result_conflict_points` 主键即分页索引 |
+| 旧结果首次分页时一次性补建索引，其间继续受理扫描；补建或取证失败返回错误，可按原结果号重试 | `result_conflict_index_status`、`app/service.py` `_build_conflict_index_locked` |
 
 补充约定：
 
@@ -29,6 +34,18 @@ Docker Compose 启动。
 - 服务重启时，中断的 `pending` 版本会标记为 `failed`，并把期间已受理的扫描补算进原
   生效版本，避免旧结果失真。
 - `RECALC_DELAY_SECONDS` 只用于演示重算窗口，生产可设为 0。
+
+按收货点分页查询补充约定：
+
+- 分页首页：`GET /batches/{id}/result?receiving_point=收货点A&page_size=50`（当前生效结果）
+  或 `GET /batches/{id}/results/{result_id}?receiving_point=...`（指定历史结果）。
+- 续页：`GET /batches/{id}/results/{result_id}?receiving_point=...&cursor=...`，
+  `result_id` 与 `receiving_point` 须与首页一致（游标内已绑定，不一致返回 422）。
+  当前结果端点不接受游标——生效结果可能随重算变更，续页必须锁定具体结果号。
+- 分页响应含 `point_conflict_count`（该点牵涉的冲突总数）、`conflicts`（本页冲突，
+  每件带全部上报点与扫描号）、`evidence`（本页引用的扫描明细，各一次）与
+  `next_cursor`（`null` 表示最后一页）。
+- 不传 `receiving_point` 时两个结果端点的响应与之前完全一致。
 
 ## 启动（Docker Compose）
 
@@ -85,6 +102,10 @@ API_BASE=http://localhost:8000 DEMO_BATCH=DEMO-1 python3 scripts/demo.py
    - 窗口内 `POST /scans` 照常 201，`result_refreshed=false`；
    - 新版本生效后，窗口内受理的扫描已包含在版本 2 的结果中。
 7. 历史结果与装箱单版本可分别查询。
+8. 按收货点分页查冲突：收货点 A 首页 2 件 → 期间更正装箱单（版本 3）并受理新扫描
+   → 续页仍锁定首页结果号，分页合并不重不漏；被两件冲突同时引用的整箱扫描在
+   `evidence` 中只出现一次，且整箱展开仍是所查结果（版本 2）的内容，与新结果
+   首页（版本 3 的展开）形成对照。
 
 ## API 一览
 
@@ -97,9 +118,9 @@ API_BASE=http://localhost:8000 DEMO_BATCH=DEMO-1 python3 scripts/demo.py
 | POST | `/batches/{id}/packing-lists/corrections` | 更正单件所属箱并重算 |
 | POST | `/batches/{id}/scans` | 接收整箱/单件扫描 |
 | GET | `/batches/{id}/scans` | 已受理扫描列表 |
-| GET | `/batches/{id}/result` | 生效核对结果 |
+| GET | `/batches/{id}/result` | 生效核对结果；`?receiving_point=&page_size=` 分页查冲突（首页） |
 | GET | `/batches/{id}/results` | 历史结果列表 |
-| GET | `/batches/{id}/results/{result_id}` | 指定历史结果 |
+| GET | `/batches/{id}/results/{result_id}` | 指定历史结果；`?receiving_point=&cursor=` 分页查冲突（首页/续页） |
 | POST | `/batches/{id}/result/refresh` | 手动重算生效版本 |
 | GET | `/health` | 健康检查 |
 
@@ -111,6 +132,11 @@ API_BASE=http://localhost:8000 DEMO_BATCH=DEMO-1 python3 scripts/demo.py
 - 读接口只认 `active_result_id`，因此任何时刻都返回某一版本的完整结果，不会看到
   “实收已更新、明细未更新”的中间态。
 - `scan_high_watermark` 记录每个结果纳入的最大扫描序号，可用于核对结果与扫描的对应关系。
+- 分页索引（`result_conflict_points` / `result_conflict_evidence` /
+  `result_conflict_index_status`）是结果快照的派生数据：新结果在写入快照的同一事务
+  内生成；旧结果在首次分页查询时用一个短写事务补建（幂等，失败可重试），期间扫描
+  受理仅在 SQLite 写锁上短暂排队，不会失败或丢失。分页查询本身只读索引与
+  `result_conflicts` / `result_scan_details` 中本页引用的行。
 
 ## 目录
 

@@ -285,6 +285,35 @@ class VerificationResultOut(BaseModel):
     details: list[ScanDetailOut]
 
 
+class ConflictPageOut(BaseModel):
+    """One page of cross-point conflicts involving one receiving point.
+
+    Returned instead of ``VerificationResultOut`` when a result query passes
+    ``receiving_point``.  Conflicts keep the original conflict order of the
+    pinned result; every item still carries all reporting points and scan
+    ids.  ``evidence`` holds each scan detail cited by this page exactly
+    once, with carton expansion taken from the queried result's snapshot.
+    """
+
+    batch_id: str
+    result_id: int
+    packing_list_version: int
+    receiving_point: str = Field(description="本次分页查询的收货点")
+    page_size: int = Field(description="每页冲突件数上限")
+    point_conflict_count: int = Field(
+        description="该收货点在本结果中牵涉的跨点冲突总数"
+    )
+    next_cursor: str | None = Field(
+        description="续页游标，随下一页请求原样回传；null 表示已是最后一页"
+    )
+    conflicts: list[ConflictItemOut] = Field(
+        description="本页冲突仪器（按原冲突顺序），每件带全部上报点与扫描号"
+    )
+    evidence: list[ScanDetailOut] = Field(
+        description="本页冲突引用的扫描明细，每条扫描只出现一次；整箱展开为所查结果的内容"
+    )
+
+
 class CorrectionOut(BaseModel):
     batch_id: str
     previous_packing_list_version: int

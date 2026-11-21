@@ -174,16 +174,44 @@ def list_scans(batch_id: str, db=Depends(get_db)):
 
 @router.get(
     "/batches/{batch_id}/result",
-    response_model=models.VerificationResultOut,
+    response_model=models.VerificationResultOut | models.ConflictPageOut,
     tags=["核对结果"],
-    summary="查询当前生效核对结果",
+    summary="查询当前生效核对结果（可按收货点分页查冲突）",
     description=(
-        "返回实收、冲突、无到货凭证及扫描明细。重算期间继续返回原装箱单的核对结果，"
-        "`packing_list_version` 可据此判断结果依据的装箱单版本。"
+        "不传 `receiving_point` 时返回完整核对结果（实收、冲突、无到货凭证及扫描明细），"
+        "重算期间继续返回原装箱单的核对结果。\n\n"
+        "传入 `receiving_point` 时按收货点分页返回跨点冲突：只列牵涉本点的冲突仪器"
+        "（每件仍带全部上报点与扫描号），并附本页引用的扫描明细（各一次，整箱展开为"
+        "所查结果的内容）。首页用本端点；续页改用 "
+        "`GET /batches/{batch_id}/results/{result_id}` 并回传 `next_cursor`，"
+        "期间即使有新扫描或装箱单更正也不漏项、不重项。"
     ),
 )
-def get_active_result(batch_id: str, db=Depends(get_db)):
-    return service.get_result(db, batch_id)
+def get_active_result(
+    batch_id: str,
+    receiving_point: str | None = Query(
+        default=None,
+        description="传入后按收货点分页返回跨点冲突；省略则返回完整核对结果",
+    ),
+    page_size: int = Query(
+        default=50, ge=1, le=500, description="每页冲突件数（分页模式生效）"
+    ),
+    cursor: str | None = Query(
+        default=None,
+        description="续页游标；首页不传。续页请改用 /batches/{batch_id}/results/{result_id}",
+    ),
+    db=Depends(get_db),
+):
+    if receiving_point is None:
+        return service.get_result(db, batch_id)
+    if cursor is not None:
+        raise service.InvalidCursorError(
+            "当前生效结果可能随重算变更；续页请使用 "
+            "GET /batches/{batch_id}/results/{result_id} 并回传 next_cursor"
+        )
+    return service.get_conflicts_page(
+        db, batch_id, None, receiving_point, None, page_size
+    )
 
 
 @router.get(
@@ -198,12 +226,37 @@ def list_results(batch_id: str, db=Depends(get_db)):
 
 @router.get(
     "/batches/{batch_id}/results/{result_id}",
-    response_model=models.VerificationResultOut,
+    response_model=models.VerificationResultOut | models.ConflictPageOut,
     tags=["核对结果"],
-    summary="按结果编号查询历史核对结果",
+    summary="按结果编号查询历史核对结果（可按收货点分页查冲突）",
+    description=(
+        "不传 `receiving_point` 时返回该结果的完整内容。\n\n"
+        "传入 `receiving_point` 时按收货点分页返回该结果的跨点冲突（指定历史结果的分页首页）；"
+        "续页回传 `next_cursor`，游标已绑定结果编号与收货点，须保持一致。"
+        "旧结果首次分页时会一次性补建分页索引（期间照常受理扫描），"
+        "补建或取证失败返回错误，可按原结果号重试。"
+    ),
 )
-def get_result_by_id(batch_id: str, result_id: int, db=Depends(get_db)):
-    return service.get_result(db, batch_id, result_id)
+def get_result_by_id(
+    batch_id: str,
+    result_id: int,
+    receiving_point: str | None = Query(
+        default=None,
+        description="传入后按收货点分页返回跨点冲突；省略则返回完整核对结果",
+    ),
+    page_size: int = Query(
+        default=50, ge=1, le=500, description="每页冲突件数（分页模式生效）"
+    ),
+    cursor: str | None = Query(
+        default=None, description="首页响应返回的 next_cursor；首页不传"
+    ),
+    db=Depends(get_db),
+):
+    if receiving_point is None:
+        return service.get_result(db, batch_id, result_id)
+    return service.get_conflicts_page(
+        db, batch_id, result_id, receiving_point, cursor, page_size
+    )
 
 
 @router.post(

@@ -571,3 +571,371 @@ def test_restart_recovers_pending_version_as_failed(tmp_path):
         versions = client2.get("/batches/B-1/packing-lists/versions").json()
         assert versions[0]["status"] == "failed"
         assert scan(client2, "B-1", "SC-3", "A", serial_no="SN-3").status_code == 201
+
+
+# ---------------------------------------------------------------------------
+# Paged conflict queries by receiving point
+# ---------------------------------------------------------------------------
+
+
+def conflict_batch(client: TestClient, batch_id: str = "B-1"):
+    """SN-1/SN-2/SN-3 conflicted across points A and B; SN-4 unevidenced.
+
+    SC-3 is a whole-carton scan of CTN-1 (SN-1, SN-2), so it is cited by two
+    conflict items — the fixture for evidence deduplication.
+    """
+    register(client, batch_id)
+    assert scan(client, batch_id, "SC-1", "A", serial_no="SN-1").status_code == 201
+    assert scan(client, batch_id, "SC-2", "B", serial_no="SN-1").status_code == 201
+    assert (
+        scan(client, batch_id, "SC-3", "A", carton_no="CTN-1", seal_intact=True).status_code
+        == 201
+    )
+    assert scan(client, batch_id, "SC-4", "B", serial_no="SN-2").status_code == 201
+    assert scan(client, batch_id, "SC-5", "A", serial_no="SN-3").status_code == 201
+    assert scan(client, batch_id, "SC-6", "B", serial_no="SN-3").status_code == 201
+
+
+def conflict_page(client: TestClient, path: str, **params):
+    response = client.get(path, params=params)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_conflict_page_first_and_continuation(client):
+    conflict_batch(client)
+    page1 = conflict_page(
+        client, "/batches/B-1/result", receiving_point="A", page_size=2
+    )
+    assert page1["receiving_point"] == "A"
+    assert page1["page_size"] == 2
+    assert page1["point_conflict_count"] == 3
+    assert page1["packing_list_version"] == 1
+    # Original conflict order (packing-list order), two items per page.
+    assert [c["serial_no"] for c in page1["conflicts"]] == ["SN-1", "SN-2"]
+    # Every item still carries all reporting points and their scan ids.
+    assert page1["conflicts"][0]["reports"] == [
+        {"receiving_point": "A", "scan_ids": ["SC-1", "SC-3"]},
+        {"receiving_point": "B", "scan_ids": ["SC-2"]},
+    ]
+    assert page1["conflicts"][1]["reports"] == [
+        {"receiving_point": "A", "scan_ids": ["SC-3"]},
+        {"receiving_point": "B", "scan_ids": ["SC-4"]},
+    ]
+    # Only the scans cited by this page, each exactly once, in scan order.
+    assert [e["scan_id"] for e in page1["evidence"]] == ["SC-1", "SC-2", "SC-3", "SC-4"]
+    assert page1["next_cursor"]
+
+    page2 = conflict_page(
+        client,
+        f"/batches/B-1/results/{page1['result_id']}",
+        receiving_point="A",
+        cursor=page1["next_cursor"],
+    )
+    assert page2["result_id"] == page1["result_id"]
+    assert [c["serial_no"] for c in page2["conflicts"]] == ["SN-3"]
+    assert [e["scan_id"] for e in page2["evidence"]] == ["SC-5", "SC-6"]
+    assert page2["next_cursor"] is None
+
+    # Pages combined equal the full result's conflict list: no gaps, no dups.
+    full = client.get(f"/batches/B-1/results/{page1['result_id']}").json()
+    paged = page1["conflicts"] + page2["conflicts"]
+    assert [c["serial_no"] for c in paged] == [
+        c["serial_no"] for c in full["conflicts"]
+    ]
+    assert paged == full["conflicts"]
+
+
+def test_conflict_page_evidence_dedup_and_snapshot_expansion(client):
+    conflict_batch(client)
+    page1 = conflict_page(
+        client, "/batches/B-1/result", receiving_point="A", page_size=2
+    )
+    cited = [e["scan_id"] for e in page1["evidence"]]
+    # SC-3 (carton CTN-1) is cited by both SN-1 and SN-2 on this page: once.
+    assert cited.count("SC-3") == 1
+    sc3 = next(e for e in page1["evidence"] if e["scan_id"] == "SC-3")
+    assert sc3["expanded_serials"] == ["SN-1", "SN-2"]
+
+    # Correct the packing list: SN-2 leaves CTN-1.  The pinned page keeps the
+    # queried result's expansion; a fresh page on the new result reflects the
+    # new version.
+    response = client.post(
+        "/batches/B-1/packing-lists/corrections",
+        json={"moves": [{"serial_no": "SN-2", "carton_no": "CTN-2"}]},
+    )
+    assert response.status_code == 200, response.text
+
+    old_page = conflict_page(
+        client,
+        f"/batches/B-1/results/{page1['result_id']}",
+        receiving_point="A",
+        page_size=2,
+    )
+    sc3_old = next(e for e in old_page["evidence"] if e["scan_id"] == "SC-3")
+    assert sc3_old["expanded_serials"] == ["SN-1", "SN-2"]
+
+    new_page = conflict_page(
+        client, "/batches/B-1/result", receiving_point="A", page_size=10
+    )
+    assert new_page["result_id"] != page1["result_id"]
+    sc3_new = next(e for e in new_page["evidence"] if e["scan_id"] == "SC-3")
+    assert sc3_new["expanded_serials"] == ["SN-1"]
+
+
+def test_conflict_page_pinned_result_immune_to_correction_and_scans(client):
+    conflict_batch(client)
+    page1 = conflict_page(
+        client, "/batches/B-1/result", receiving_point="A", page_size=2
+    )
+    pinned = page1["result_id"]
+
+    # Meanwhile: a packing-list correction activates a new version and a new
+    # scan is accepted.  Continuation must still follow the pinned result.
+    response = client.post(
+        "/batches/B-1/packing-lists/corrections",
+        json={"moves": [{"serial_no": "SN-4", "carton_no": "CTN-1"}]},
+    )
+    assert response.status_code == 200, response.text
+    assert scan(client, "B-1", "SC-7", "A", serial_no="SN-4").status_code == 201
+
+    page2 = conflict_page(
+        client,
+        f"/batches/B-1/results/{pinned}",
+        receiving_point="A",
+        cursor=page1["next_cursor"],
+    )
+    assert page2["result_id"] == pinned
+    assert page2["packing_list_version"] == 1
+    assert [c["serial_no"] for c in page2["conflicts"]] == ["SN-3"]
+    assert page2["next_cursor"] is None
+
+    serials = [c["serial_no"] for c in page1["conflicts"] + page2["conflicts"]]
+    assert serials == ["SN-1", "SN-2", "SN-3"]  # 不重不漏
+
+
+def test_conflict_page_for_point_without_conflicts(client):
+    conflict_batch(client)
+    page = conflict_page(client, "/batches/B-1/result", receiving_point="C")
+    assert page["conflicts"] == []
+    assert page["evidence"] == []
+    assert page["point_conflict_count"] == 0
+    assert page["next_cursor"] is None
+
+
+def test_result_without_receiving_point_keeps_original_shape(client):
+    conflict_batch(client)
+    data = result(client)
+    for key in ("received", "conflicts", "unevidenced", "details", "scan_high_watermark"):
+        assert key in data
+    assert "next_cursor" not in data
+    assert "evidence" not in data
+    by_id = client.get(f"/batches/B-1/results/{data['result_id']}").json()
+    assert "details" in by_id
+    assert "next_cursor" not in by_id
+
+
+def test_conflict_page_cursor_validation(client):
+    conflict_batch(client)
+    page1 = conflict_page(
+        client, "/batches/B-1/result", receiving_point="A", page_size=2
+    )
+    cursor = page1["next_cursor"]
+    rid = page1["result_id"]
+
+    # Cursor bound to a different receiving point.
+    response = client.get(
+        f"/batches/B-1/results/{rid}", params={"receiving_point": "B", "cursor": cursor}
+    )
+    assert response.status_code == 422
+
+    # Cursor bound to a different result id.
+    client.post("/batches/B-1/result/refresh")
+    other = result(client)["result_id"]
+    assert other != rid
+    response = client.get(
+        f"/batches/B-1/results/{other}",
+        params={"receiving_point": "A", "cursor": cursor},
+    )
+    assert response.status_code == 422
+
+    # Garbage cursor.
+    response = client.get(
+        f"/batches/B-1/results/{rid}",
+        params={"receiving_point": "A", "cursor": "garbage"},
+    )
+    assert response.status_code == 422
+
+    # The active-result endpoint does not accept continuation cursors.
+    response = client.get(
+        "/batches/B-1/result", params={"receiving_point": "A", "cursor": cursor}
+    )
+    assert response.status_code == 422
+
+    # page_size bounds.
+    assert (
+        client.get(
+            "/batches/B-1/result", params={"receiving_point": "A", "page_size": 0}
+        ).status_code
+        == 422
+    )
+
+
+def drop_conflict_index(db_path: str, result_id: int) -> None:
+    """Simulate a result persisted before the paged-query feature existed."""
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DELETE FROM result_conflict_points WHERE result_id = ?", (result_id,))
+        conn.execute(
+            "DELETE FROM result_conflict_evidence WHERE result_id = ?", (result_id,)
+        )
+        conn.execute(
+            "DELETE FROM result_conflict_index_status WHERE result_id = ?", (result_id,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_conflict_page_backfills_index_for_old_result(tmp_path):
+    settings = Settings(db_path=str(tmp_path / "old.db"), recalc_delay_seconds=0.0)
+    app = create_app(settings)
+    with TestClient(app) as client:
+        conflict_batch(client)
+        rid = result(client)["result_id"]
+        drop_conflict_index(settings.db_path, rid)
+
+        # Scan intake keeps working before the backfill is triggered.
+        assert scan(client, "B-1", "SC-7", "A", serial_no="SN-4").status_code == 201
+
+        page = conflict_page(
+            client, f"/batches/B-1/results/{rid}", receiving_point="A", page_size=10
+        )
+        assert [c["serial_no"] for c in page["conflicts"]] == ["SN-1", "SN-2", "SN-3"]
+        assert [e["scan_id"] for e in page["evidence"]] == [
+            "SC-1",
+            "SC-2",
+            "SC-3",
+            "SC-4",
+            "SC-5",
+            "SC-6",
+        ]
+
+        # The backfilled index matches what a fresh result would have.
+        import sqlite3
+
+        conn = sqlite3.connect(settings.db_path)
+        try:
+            points = conn.execute(
+                "SELECT COUNT(*) FROM result_conflict_points WHERE result_id = ?",
+                (rid,),
+            ).fetchone()[0]
+            assert points == 6  # 3 conflicts x 2 reporting points
+            status = conn.execute(
+                "SELECT built_at FROM result_conflict_index_status WHERE result_id = ?",
+                (rid,),
+            ).fetchone()
+            assert status is not None
+        finally:
+            conn.close()
+
+
+def test_conflict_page_backfill_failure_is_retryable(tmp_path, monkeypatch):
+    settings = Settings(db_path=str(tmp_path / "backfill.db"), recalc_delay_seconds=0.0)
+    app = create_app(settings)
+    with TestClient(app) as client:
+        conflict_batch(client)
+        rid = result(client)["result_id"]
+        drop_conflict_index(settings.db_path, rid)
+
+        from app import service
+
+        def explode(conn, result_id):
+            raise RuntimeError("simulated backfill failure")
+
+        monkeypatch.setattr(service, "_build_conflict_index_locked", explode)
+        response = client.get(
+            f"/batches/B-1/results/{rid}", params={"receiving_point": "A"}
+        )
+        assert response.status_code == 500
+        assert "重试" in response.text
+
+        # The caller retries with the same result id and succeeds.
+        monkeypatch.undo()
+        retry = conflict_page(client, f"/batches/B-1/results/{rid}", receiving_point="A")
+        assert [c["serial_no"] for c in retry["conflicts"]] == ["SN-1", "SN-2", "SN-3"]
+
+
+def test_conflict_page_missing_evidence_fails(tmp_path):
+    settings = Settings(db_path=str(tmp_path / "evidence.db"), recalc_delay_seconds=0.0)
+    app = create_app(settings)
+    with TestClient(app) as client:
+        conflict_batch(client)
+        rid = result(client)["result_id"]
+        drop_conflict_index(settings.db_path, rid)
+
+        # Corrupt the snapshot: a cited scan detail is gone.
+        import sqlite3
+
+        conn = sqlite3.connect(settings.db_path)
+        try:
+            conn.execute(
+                "DELETE FROM result_scan_details WHERE result_id = ? AND scan_id = 'SC-2'",
+                (rid,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        response = client.get(
+            f"/batches/B-1/results/{rid}", params={"receiving_point": "A"}
+        )
+        assert response.status_code == 500
+        assert "取证" in response.text
+        assert "SC-2" in response.text
+
+
+def test_conflict_page_scans_accepted_during_backfill(tmp_path):
+    """A slow backfill must not block scan intake (writers only serialise)."""
+    import threading
+    import time
+
+    settings = Settings(db_path=str(tmp_path / "concurrent.db"), recalc_delay_seconds=0.0)
+    app = create_app(settings)
+    with TestClient(app) as client:
+        conflict_batch(client)
+        rid = result(client)["result_id"]
+        drop_conflict_index(settings.db_path, rid)
+
+        from app import service
+
+        original = service._build_conflict_index_locked
+
+        def slow(conn, result_id):
+            time.sleep(0.4)
+            return original(conn, result_id)
+
+        service._build_conflict_index_locked = slow
+        outcome: dict[str, object] = {}
+
+        def page():
+            outcome["response"] = client.get(
+                f"/batches/B-1/results/{rid}", params={"receiving_point": "A"}
+            )
+
+        try:
+            thread = threading.Thread(target=page)
+            thread.start()
+            time.sleep(0.05)  # let the backfill's writer transaction start
+            accepted = scan(client, "B-1", "SC-7", "A", serial_no="SN-4")
+            assert accepted.status_code == 201
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+        finally:
+            service._build_conflict_index_locked = original
+
+        assert outcome["response"].status_code == 200, outcome["response"].text
+        body = outcome["response"].json()
+        assert [c["serial_no"] for c in body["conflicts"]] == ["SN-1", "SN-2", "SN-3"]

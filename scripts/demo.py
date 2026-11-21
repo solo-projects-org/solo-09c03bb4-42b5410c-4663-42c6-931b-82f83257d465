@@ -25,6 +25,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 BASE = os.getenv("API_BASE", "http://127.0.0.1:8000").rstrip("/")
@@ -246,6 +247,117 @@ def main() -> int:
     )
     _, versions = call("GET", f"/batches/{BATCH}/packing-lists/versions", expect=200)
     print("装箱单版本:", json.dumps(versions, ensure_ascii=False, indent=2))
+
+    show("6. 按收货点分页查询冲突；更正后续页不重不漏")
+    # 此时 SN-1003、SN-1004 已是跨点冲突；再让 SN-1005、SN-1006 也成为冲突，
+    # 其中 SC-A-005 整箱扫描同时覆盖这两件（用于演示证据去重）。
+    call(
+        "POST",
+        f"/batches/{BATCH}/scans",
+        {
+            "scan_id": "SC-A-005",
+            "receiving_point": "收货点A",
+            "carton_no": "CTN-C",
+            "seal_intact": True,
+        },
+        expect=201,
+    )
+    call(
+        "POST",
+        f"/batches/{BATCH}/scans",
+        {"scan_id": "SC-B-004", "receiving_point": "收货点B", "serial_no": "SN-1005"},
+        expect=201,
+    )
+    call(
+        "POST",
+        f"/batches/{BATCH}/scans",
+        {"scan_id": "SC-B-005", "receiving_point": "收货点B", "serial_no": "SN-1006"},
+        expect=201,
+    )
+
+    # 首页：当前生效结果，每页 2 件。
+    query = urllib.parse.urlencode({"receiving_point": "收货点A", "page_size": "2"})
+    _, page1 = call("GET", f"/batches/{BATCH}/result?{query}", expect=200)
+    pinned = page1["result_id"]
+    print(
+        f"首页: 结果 {pinned} (装箱单版本 {page1['packing_list_version']}), "
+        f"收货点A 共牵涉 {page1['point_conflict_count']} 件冲突"
+    )
+    print("  冲突:", [c["serial_no"] for c in page1["conflicts"]])
+    print(
+        "  每件仍带全部上报点:",
+        json.dumps(page1["conflicts"][0]["reports"], ensure_ascii=False),
+    )
+    evidence1 = [e["scan_id"] for e in page1["evidence"]]
+    print("  本页引用扫描:", evidence1)
+    if evidence1.count("SC-B-002") != 1:
+        raise SystemExit("整箱扫描 SC-B-002 被本页两件冲突引用，应只返回一次")
+    print("  SC-B-002 被本页两件冲突引用，只返回 1 次")
+    print("  next_cursor:", page1["next_cursor"])
+
+    # 期间：更正 SN-1006 到 CTN-A（版本 3 生效）并受理新扫描。
+    _, correction = call(
+        "POST",
+        f"/batches/{BATCH}/packing-lists/corrections",
+        {
+            "reason": "复核发现 SN-1006 实际在 CTN-A",
+            "moves": [{"serial_no": "SN-1006", "carton_no": "CTN-A"}],
+        },
+        expect=200,
+    )
+    call(
+        "POST",
+        f"/batches/{BATCH}/scans",
+        {"scan_id": "SC-A-006", "receiving_point": "收货点A", "serial_no": "SN-1002"},
+        expect=201,
+    )
+    print(
+        f"期间已生效装箱单版本 {correction['packing_list_version']} 并受理新扫描；"
+        f"续页仍锁定结果 {pinned}"
+    )
+
+    # 续页：沿用同一结果号与游标。
+    query2 = urllib.parse.urlencode(
+        {"receiving_point": "收货点A", "cursor": page1["next_cursor"]}
+    )
+    _, page2 = call("GET", f"/batches/{BATCH}/results/{pinned}?{query2}", expect=200)
+    print("续页冲突:", [c["serial_no"] for c in page2["conflicts"]])
+    evidence2 = [e["scan_id"] for e in page2["evidence"]]
+    print("  本页引用扫描:", evidence2)
+    sc_a005 = next(e for e in page2["evidence"] if e["scan_id"] == "SC-A-005")
+    if evidence2.count("SC-A-005") != 1:
+        raise SystemExit("整箱扫描 SC-A-005 被本页两件冲突引用，应只返回一次")
+    print(
+        "  SC-A-005 被 SN-1005/SN-1006 同时引用，只返回 1 次；"
+        f"整箱展开仍为所查结果（版本 {page2['packing_list_version']}）的内容:",
+        sc_a005["expanded_serials"],
+    )
+    if page2["next_cursor"] is not None:
+        raise SystemExit("预期已是最后一页")
+
+    # 与锁定结果的完整响应对照：分页合并不重不漏。
+    _, full = call("GET", f"/batches/{BATCH}/results/{pinned}", expect=200)
+    paged_serials = [c["serial_no"] for c in page1["conflicts"] + page2["conflicts"]]
+    expected = [
+        c["serial_no"]
+        for c in full["conflicts"]
+        if any(r["receiving_point"] == "收货点A" for r in c["reports"])
+    ]
+    if paged_serials != expected:
+        raise SystemExit(f"分页结果与完整结果不一致: {paged_serials} != {expected}")
+    print("分页合并与完整结果一致（不重不漏）:", paged_serials)
+
+    # 新生效结果独立分页：SN-1006 在新版本中不再是冲突，
+    # SC-A-005 的整箱展开按新版本只有 SN-1005。
+    query3 = urllib.parse.urlencode({"receiving_point": "收货点A", "page_size": "10"})
+    _, fresh = call("GET", f"/batches/{BATCH}/result?{query3}", expect=200)
+    fresh_sc = next(e for e in fresh["evidence"] if e["scan_id"] == "SC-A-005")
+    print(
+        f"新结果 {fresh['result_id']} (版本 {fresh['packing_list_version']}) 冲突:",
+        [c["serial_no"] for c in fresh["conflicts"]],
+        "| SC-A-005 按新版本展开:",
+        fresh_sc["expanded_serials"],
+    )
 
     print(f"\nSwagger: {BASE}/docs  |  批次: {BATCH}")
     return 0

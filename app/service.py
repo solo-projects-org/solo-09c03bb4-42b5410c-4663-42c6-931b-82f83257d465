@@ -16,6 +16,8 @@ Key invariants
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import sqlite3
@@ -50,6 +52,10 @@ class ConflictError(ServiceError):
 
 
 class InvalidCorrectionError(ServiceError):
+    status_code = 422
+
+
+class InvalidCursorError(ServiceError):
     status_code = 422
 
 
@@ -313,6 +319,58 @@ def compute_verification(
     }
 
 
+def _conflict_index_rows(
+    conflicts: Sequence[tuple[str, int, Any]],
+    scan_seq: dict[str, int],
+) -> tuple[list[tuple[str, int, str]], list[tuple[str, int]], set[str]]:
+    """Derive conflict-index rows from conflicts and a scan_id -> seq map.
+
+    ``conflicts`` is a list of ``(serial_no, position, reports)`` in the
+    original conflict order.  Returns ``(point_rows, evidence_rows, missing)``
+    where ``missing`` holds scan ids cited by reports but absent from
+    ``scan_seq`` (only possible for a corrupted snapshot).
+    """
+    point_rows: list[tuple[str, int, str]] = []
+    evidence_rows: list[tuple[str, int]] = []
+    missing: set[str] = set()
+    for serial_no, position, reports in conflicts:
+        for report in reports:
+            point_rows.append((report["receiving_point"], position, serial_no))
+            for scan_id in report["scan_ids"]:
+                seq = scan_seq.get(scan_id)
+                if seq is None:
+                    missing.add(scan_id)
+                else:
+                    evidence_rows.append((serial_no, seq))
+    return point_rows, evidence_rows, missing
+
+
+def _write_conflict_index(
+    conn: sqlite3.Connection,
+    result_id: int,
+    point_rows: Sequence[tuple[str, int, str]],
+    evidence_rows: Sequence[tuple[str, int]],
+) -> None:
+    conn.executemany(
+        """
+        INSERT INTO result_conflict_points (result_id, receiving_point, position, serial_no)
+        VALUES (?, ?, ?, ?)
+        """,
+        [(result_id, point, position, serial) for point, position, serial in point_rows],
+    )
+    conn.executemany(
+        """
+        INSERT INTO result_conflict_evidence (result_id, serial_no, seq)
+        VALUES (?, ?, ?)
+        """,
+        [(result_id, serial, seq) for serial, seq in evidence_rows],
+    )
+    conn.execute(
+        "INSERT INTO result_conflict_index_status (result_id, built_at) VALUES (?, ?)",
+        (result_id, now_utc()),
+    )
+
+
 def _persist_result(
     conn: sqlite3.Connection,
     batch_id: str,
@@ -411,7 +469,87 @@ def _persist_result(
             for detail in computed["details"]
         ],
     )
+
+    # Paged conflict queries are served from the conflict index; build it in
+    # the same transaction so every persisted result is pageable at once.
+    scan_seq = {detail["scan_id"]: detail["seq"] for detail in computed["details"]}
+    point_rows, evidence_rows, missing = _conflict_index_rows(
+        [
+            (item["serial_no"], position, item["reports"])
+            for position, item in enumerate(computed["conflicts"])
+        ],
+        scan_seq,
+    )
+    if missing:  # defensive: reports always cite scans persisted above
+        logger.error(
+            "conflict index for new result %s: scan ids missing from details: %s",
+            result_id,
+            sorted(missing),
+        )
+    _write_conflict_index(conn, result_id, point_rows, evidence_rows)
     return result_id
+
+
+def _build_conflict_index_locked(conn: sqlite3.Connection, result_id: int) -> None:
+    """Backfill the conflict index for a result persisted before it existed.
+
+    Runs inside one short writer transaction, so scan intake keeps being
+    accepted (writers merely serialise for the duration).  Only the cited
+    scan ids are resolved, via ``idx_scan_details_scan_id`` — never a full
+    scan of the batch's detail rows.  A failure rolls everything back and
+    the caller may retry with the same result id.
+    """
+    conflict_rows = conn.execute(
+        """
+        SELECT serial_no, reports_json, position FROM result_conflicts
+         WHERE result_id = ? ORDER BY position
+        """,
+        (result_id,),
+    ).fetchall()
+    parsed: list[tuple[str, int, Any]] = []
+    needed: set[str] = set()
+    for row in conflict_rows:
+        reports = json.loads(row["reports_json"])
+        parsed.append((row["serial_no"], row["position"], reports))
+        for report in reports:
+            needed.update(report["scan_ids"])
+
+    scan_seq: dict[str, int] = {}
+    needed_list = sorted(needed)
+    for start in range(0, len(needed_list), 500):
+        chunk = needed_list[start : start + 500]
+        placeholders = ", ".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"""
+            SELECT scan_id, seq FROM result_scan_details
+             WHERE result_id = ? AND scan_id IN ({placeholders})
+            """,
+            (result_id, *chunk),
+        ).fetchall()
+        for row in rows:
+            scan_seq[row["scan_id"]] = row["seq"]
+
+    point_rows, evidence_rows, missing = _conflict_index_rows(parsed, scan_seq)
+    if missing:
+        raise InternalError(
+            {
+                "message": "核对结果的扫描取证数据缺失，无法补建分页索引；"
+                "请按原结果号重试，或联系运维核查该结果的扫描明细",
+                "result_id": result_id,
+                "missing_scan_ids": sorted(missing),
+            }
+        )
+    _write_conflict_index(conn, result_id, point_rows, evidence_rows)
+
+
+def _ensure_conflict_index_locked(conn: sqlite3.Connection, result_id: int) -> None:
+    """Build the conflict index for ``result_id`` if it does not exist yet."""
+    built = conn.execute(
+        "SELECT 1 FROM result_conflict_index_status WHERE result_id = ?",
+        (result_id,),
+    ).fetchone()
+    if built is None:
+        _build_conflict_index_locked(conn, result_id)
 
 
 def _scans_snapshot(conn: sqlite3.Connection, batch_id: str) -> tuple[list[sqlite3.Row], int]:
@@ -915,6 +1053,193 @@ def get_result(
                 for item in details
             ],
         }
+
+
+# ---------------------------------------------------------------------------
+# Paged conflict queries (per receiving point)
+# ---------------------------------------------------------------------------
+
+_CURSOR_PREFIX = "cp1"
+
+
+def _encode_cursor(result_id: int, receiving_point: str, position: int) -> str:
+    payload = json.dumps(
+        {"r": result_id, "p": receiving_point, "pos": position},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    token = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"{_CURSOR_PREFIX}.{token}"
+
+
+def _decode_cursor(cursor: str) -> tuple[int, str, int]:
+    try:
+        prefix, _, token = cursor.partition(".")
+        if prefix != _CURSOR_PREFIX or not token:
+            raise ValueError("unknown cursor prefix")
+        padding = "=" * (-len(token) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(token + padding))
+        result_id = int(payload["r"])
+        receiving_point = str(payload["p"])
+        position = int(payload["pos"])
+        if result_id <= 0 or position < 0:
+            raise ValueError("cursor fields out of range")
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError, binascii.Error):
+        raise InvalidCursorError(
+            "续页游标无效，请原样回传首页响应中的 next_cursor"
+        ) from None
+    return result_id, receiving_point, position
+
+
+def get_conflicts_page(
+    db: Database,
+    batch_id: str,
+    result_id: int | None,
+    receiving_point: str,
+    cursor: str | None,
+    page_size: int,
+) -> dict[str, Any]:
+    """Page cross-point conflicts involving ``receiving_point``.
+
+    The page is pinned to one persisted result snapshot: the first page uses
+    the active result (``result_id=None``) or an explicitly requested
+    historical one, and continuations follow the result id and receiving
+    point encoded in the cursor.  Scans accepted or packing-list corrections
+    activated between pages therefore cannot shift the page boundaries — no
+    missed or duplicated items.  Only the point's conflict rows and the scan
+    details cited by the current page are read; the rest of the batch's
+    snapshot is never scanned.
+    """
+    start_position = 0
+    if cursor is not None:
+        cursor_result, cursor_point, cursor_position = _decode_cursor(cursor)
+        if result_id is not None and cursor_result != result_id:
+            raise InvalidCursorError(
+                "续页游标与结果编号不一致；续页须沿用首页返回的结果编号与 next_cursor"
+            )
+        if cursor_point != receiving_point:
+            raise InvalidCursorError(
+                "续页游标与收货点不一致；续页须沿用首页的收货点"
+            )
+        result_id = cursor_result
+        start_position = cursor_position
+
+    # Resolve the result and make sure its conflict index exists.  Results
+    # persisted before this feature are backfilled here in one short writer
+    # transaction; scan intake keeps being accepted meanwhile (writers only
+    # serialise briefly).  A backfill failure rolls back cleanly and the
+    # caller may retry with the same result id.
+    with db.immediate() as conn:
+        batch = _batch_row(conn, batch_id)
+        if result_id is None:
+            if batch["active_result_id"] is None:
+                raise NotFoundError(f"批次 {batch_id} 暂无核对结果")
+            result_id = int(batch["active_result_id"])
+        else:
+            _result_id_for_batch(conn, batch, result_id)
+        try:
+            _ensure_conflict_index_locked(conn, result_id)
+        except ServiceError:
+            raise
+        except Exception as exc:
+            raise InternalError(
+                f"核对结果 {result_id} 的分页索引补建失败，可按原结果号重试"
+            ) from exc
+
+    with db.read() as conn:
+        result_row = conn.execute(
+            "SELECT * FROM verification_results WHERE id = ?", (result_id,)
+        ).fetchone()
+        total = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM result_conflict_points
+             WHERE result_id = ? AND receiving_point = ?
+            """,
+            (result_id, receiving_point),
+        ).fetchone()["c"]
+        rows = conn.execute(
+            """
+            SELECT serial_no, position FROM result_conflict_points
+             WHERE result_id = ? AND receiving_point = ? AND position >= ?
+             ORDER BY position
+             LIMIT ?
+            """,
+            (result_id, receiving_point, start_position, page_size + 1),
+        ).fetchall()
+        has_more = len(rows) > page_size
+        next_position = rows[page_size]["position"] if has_more else None
+        page_rows = rows[:page_size]
+        serials = [row["serial_no"] for row in page_rows]
+
+        conflicts: list[dict[str, Any]] = []
+        evidence: list[dict[str, Any]] = []
+        if serials:
+            placeholders = ", ".join("?" for _ in serials)
+            conflict_rows = conn.execute(
+                f"""
+                SELECT serial_no, carton_no, reports_json FROM result_conflicts
+                 WHERE result_id = ? AND serial_no IN ({placeholders})
+                """,
+                (result_id, *serials),
+            ).fetchall()
+            by_serial = {row["serial_no"]: row for row in conflict_rows}
+            for row in page_rows:  # keep the original conflict order
+                item = by_serial[row["serial_no"]]
+                conflicts.append(
+                    {
+                        "serial_no": item["serial_no"],
+                        "carton_no": item["carton_no"],
+                        "reports": json.loads(item["reports_json"]),
+                    }
+                )
+            # Each cited scan detail is returned once per page, even when
+            # several conflicts on the page cite it (e.g. one carton scan
+            # covering two conflicted items).  Carton expansion comes from
+            # the queried result's own snapshot rows.
+            evidence_rows = conn.execute(
+                f"""
+                SELECT DISTINCT d.*
+                  FROM result_conflict_evidence e
+                  JOIN result_scan_details d
+                    ON d.result_id = e.result_id AND d.seq = e.seq
+                 WHERE e.result_id = ? AND e.serial_no IN ({placeholders})
+                 ORDER BY d.seq
+                """,
+                (result_id, *serials),
+            ).fetchall()
+            evidence = [
+                {
+                    "seq": row["seq"],
+                    "scan_id": row["scan_id"],
+                    "receiving_point": row["receiving_point"],
+                    "kind": row["kind"],
+                    "carton_no": row["carton_no"],
+                    "serial_no": row["serial_no"],
+                    "seal_intact": (
+                        None if row["seal_intact"] is None else bool(row["seal_intact"])
+                    ),
+                    "accepted_at": row["accepted_at"],
+                    "expanded_serials": json.loads(row["expanded_json"]),
+                    "unmatched": bool(row["unmatched"]),
+                }
+                for row in evidence_rows
+            ]
+
+    return {
+        "batch_id": batch_id,
+        "result_id": result_id,
+        "packing_list_version": result_row["packing_list_version"],
+        "receiving_point": receiving_point,
+        "page_size": page_size,
+        "point_conflict_count": total,
+        "next_cursor": (
+            _encode_cursor(result_id, receiving_point, next_position)
+            if has_more
+            else None
+        ),
+        "conflicts": conflicts,
+        "evidence": evidence,
+    }
 
 
 def list_results(db: Database, batch_id: str) -> list[dict[str, Any]]:

@@ -38,7 +38,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "4. `POST /batches/{batch_id}/packing-lists/corrections` 更正单件所属的箱，"
             "以新版本重算；重算期间查询仍返回原版本结果。\n"
             "5. `GET /batches/{batch_id}/result` 查询已保存的核对结果（实收、冲突、"
-            "无凭证、扫描明细）。"
+            "无凭证、扫描明细）；加 `receiving_point` 参数可按收货点分页查跨点冲突，"
+            "续页用 `GET /batches/{batch_id}/results/{result_id}` 回传游标。"
         ),
         lifespan=lifespan,
         docs_url="/docs",

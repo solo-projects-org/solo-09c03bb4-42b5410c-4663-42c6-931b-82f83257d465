@@ -146,6 +146,40 @@ CREATE TABLE IF NOT EXISTS result_scan_details (
     unmatched      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (result_id, seq)
 );
+-- Lets the conflict-index backfill resolve referenced scans without
+-- reading every detail row of the batch.
+CREATE INDEX IF NOT EXISTS idx_scan_details_scan_id
+    ON result_scan_details(result_id, scan_id);
+
+-- Per-receiving-point conflict index for paged conflict queries.  The
+-- primary key doubles as the pagination index: it locates one point's
+-- conflicts in the original conflict order without touching the rest of
+-- the result snapshot.
+CREATE TABLE IF NOT EXISTS result_conflict_points (
+    result_id       INTEGER NOT NULL REFERENCES verification_results(id),
+    receiving_point TEXT NOT NULL,
+    position        INTEGER NOT NULL,
+    serial_no       TEXT NOT NULL,
+    PRIMARY KEY (result_id, receiving_point, position)
+);
+
+-- Which scan-detail rows (by seq) each conflict item cites.  A page query
+-- joins this against result_scan_details and deduplicates by seq, so a
+-- scan cited by several conflicts on the page is returned only once.
+CREATE TABLE IF NOT EXISTS result_conflict_evidence (
+    result_id INTEGER NOT NULL REFERENCES verification_results(id),
+    serial_no TEXT NOT NULL,
+    seq       INTEGER NOT NULL,
+    PRIMARY KEY (result_id, serial_no, seq)
+);
+
+-- Results written before the paged-query feature have no index rows; the
+-- first paged query backfills them in one short transaction and records
+-- completion here.  Retrying after a failed backfill is idempotent.
+CREATE TABLE IF NOT EXISTS result_conflict_index_status (
+    result_id INTEGER PRIMARY KEY REFERENCES verification_results(id),
+    built_at  TEXT NOT NULL
+);
 """
 
 
